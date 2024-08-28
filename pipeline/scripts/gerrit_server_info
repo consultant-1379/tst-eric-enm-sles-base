@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+
+GERRIT_PORT="29418"
+GERRIT_SERVER="gerrit.ericsson.se"
+GERRIT_MIRROR_SERVER="gerritmirror-ha.lmera.ericsson.se"

@@ -1,0 +1,160 @@
+modelVersion: 2.0
+
+description: "ENM: SLES Base Image Pipeline"
+
+import:
+  imported-ruleset: ./ci/bob/eric-enm-common-ruleset.yaml
+
+docker:
+  registry: https://armdocker.rnd.ericsson.se/proj-enm
+
+docker-images:
+  - adp-release-auto: armdocker.rnd.ericsson.se/proj-adp-cicd-drop/bob-adp-release-auto:${env.ADP_RELEASE_AUTO_TAG}
+  - eric-enm-version-auto: armdocker.rnd.ericsson.se/proj-enm/eric-enm-version-auto:${env.ENM_VERSION_AUTO_TAG}
+
+properties:
+  - image-name: tst-eric-enm-sles-base
+  - image-repo: https://armdocker.rnd.ericsson.se/proj-enm
+  - docker-image-path: armdocker.rnd.ericsson.se/proj-enm/${image-name}
+  - docker-internal-image-path: armdocker.rnd.ericsson.se/proj-enm-ci-internal/${image-name}
+  - docker-proj_oss_releases-image-path: armdocker.rnd.ericsson.se/proj_oss_releases/${image-name}
+  - image-base-os-version: "3.49.0-4"
+  - common-ruleset-name: eric-enm-common-ruleset
+
+env:
+  - ADP_HELM_DR_CHECK_TAG (default=latest)
+  - ADP_RELEASE_AUTO_TAG (default=4.7.2)
+  - ENM_VERSION_AUTO_TAG (default=latest)
+  - ENM_YQ_TAG (default=latest)
+  - RELEASE (default=true)
+  - ISO_VERSION (default=1.0.5555)
+  - BUILD_DATE (default = $(date +%d%m%Y-%H%M%S --utc))
+  - AUTHOR_NAME
+  - AUTHOR_EMAIL
+  - GIT_COMMITTER_NAME
+  - HELM_REPO_TOKEN
+  - GIT_COMMITTER_EMAIL
+  - ENM_ISO_REPO_VERSION
+  - COMMON_RULESET_VERSION (default=1.0.18-1)
+  - ARM_COMMON_RULESET_REPO (default=proj-eric-oss-drop-generic)
+  - ARM_SERVER_FQDN (default=arm.seli.gic.ericsson.se)
+  - HELM_REPO_USER (default=cenmbuild) 
+
+var:
+  - commit-hash
+  - version
+  - version-prefix
+  - rstate
+
+rules:
+  init-common-ruleset:
+    - task: get-common-ruleset
+      docker-image: adp-release-auto
+      cmd:
+        - rm ci/bob/${common-ruleset-name}.yaml
+        # Get desired version of common ruleset
+        - curl https://${env.ARM_SERVER_FQDN}/artifactory/${env.ARM_COMMON_RULESET_REPO}-local/eric-enm/${common-ruleset-name}-ci/${common-ruleset-name}-${env.COMMON_RULESET_VERSION}.yaml --output ci/bob/${common-ruleset-name}.yaml -u ${env.HELM_REPO_USER}:${env.HELM_REPO_TOKEN}
+        # Extract common ruleset version
+        - cat ci/bob/${common-ruleset-name}.yaml | grep 'version:' | head -n1 | awk '{print $2}' > ci/bob/COMMON_RULESET_VERSION
+        - cat ci/bob/COMMON_RULESET_VERSION
+
+  generate-yum-repo-version:
+    - task: get_repo_version
+      docker-image: eric-enm-version-auto
+      cmd: /replacement.sh Dockerfile ${env.ENM_ISO_REPO_VERSION}
+
+  generate-metadata-parameters: 
+    - rule: imported-ruleset.generate-metadata-parameters
+      properties:
+        - enm-vesrion-auto-tag: ${env.ENM_VERSION_AUTO_TAG}
+
+  generate-new-version: 
+    - rule: imported-ruleset.generate-new-version
+      properties:
+        - adp-release-auto-tag: ${env.ADP_RELEASE_AUTO_TAG}
+
+  build-image:
+    - task: build-docker-image
+      cmd:
+        - docker build . --build-arg GIT_COMMIT=${var.commit-hash} --build-arg OS_BASE_IMAGE_TAG=${image-base-os-version} --build-arg BUILD_DATE=${env.BUILD_DATE} --build-arg IMAGE_BUILD_VERSION=${var.version} --build-arg RSTATE=${var.rstate} --build-arg ISO_VERSION=${env.ISO_VERSION} --build-arg ENM_ISO_REPO_VERSION=${env.ENM_ISO_REPO_VERSION} --tag ${docker-image-path}:${var.version}
+
+  build-image-with-all-tags:
+    - task: build-docker-image-with-tags
+      cmd:
+        - docker build . --build-arg GIT_COMMIT=${var.commit-hash} --build-arg OS_BASE_IMAGE_TAG=${image-base-os-version} --build-arg BUILD_DATE=${env.BUILD_DATE} --build-arg IMAGE_BUILD_VERSION=${var.version} --build-arg RSTATE=${var.rstate} --build-arg ISO_VERSION=${env.ISO_VERSION} --build-arg ENM_ISO_REPO_VERSION=${env.ENM_ISO_REPO_VERSION} --tag ${docker-image-path}:${var.version}
+        - docker image tag ${docker-image-path}:${var.version} ${docker-image-path}:${var.version-prefix}-latest
+        - docker image tag ${docker-image-path}:${var.version} ${docker-image-path}:latest
+
+  build-image-with-all-tags-internal:
+    - task: build-docker-image-with-tags
+      cmd:
+        - docker build . --build-arg GIT_COMMIT=${var.commit-hash} --build-arg OS_BASE_IMAGE_TAG=${image-base-os-version} --build-arg BUILD_DATE=${env.BUILD_DATE} --build-arg IMAGE_BUILD_VERSION=${var.version} --build-arg RSTATE=${var.rstate} --build-arg ISO_VERSION=${env.ISO_VERSION} --tag ${docker-image-path}:${var.version}
+        - docker image tag ${docker-image-path}:${var.version} ${docker-image-path}:${var.version-prefix}-latest
+        - docker image tag ${docker-image-path}:${var.version} ${docker-image-path}:latest
+
+  push-image-with-all-tags:
+    - task: imported-ruleset.push-image-with-all-tags:push-docker-image
+      properties:
+        - docker-image-path: ${docker-image-path}
+
+  remove-image:
+    - task: imported-ruleset.remove-image:remove-docker-image
+      properties:
+        - docker-image-path: ${docker-image-path}
+
+  remove-image-with-all-tags:
+    - task: imported-ruleset.remove-image-with-all-tags:remove-docker-image-with-tags
+      properties:
+        - docker-image-path: ${docker-image-path}
+
+  generate-output-parameters:
+    - task: generate-version
+      cmd: echo -e "IMAGE_NAME=${image-name}\nIMAGE_TAG=${var.version}\nIMAGE_REPO=${image-repo}" >> artifact.properties
+
+  create-git-tag:
+    - rule: imported-ruleset.create-git-tag
+      properties:
+        - adp-release-auto-tag: ${env.ADP_RELEASE_AUTO_TAG}
+
+  remove-git-tag:
+    - rule: imported-ruleset.remove-git-tag
+      properties:
+        - adp-release-auto-tag: ${env.ADP_RELEASE_AUTO_TAG}
+
+  push-image:
+    - task: imported-ruleset.push-image:push-docker-image
+      properties:
+        - docker-image-path: ${docker-image-path}
+
+  generate-output-parameters-internal-stage:
+    - task: generate-version
+      cmd: echo -e "IMAGE_NAME=${image-name}\nIMAGE_TAG=${var.version}\nIMAGE_REPO=${image-repo}" >> artifact.properties
+
+  push-image-with-all-tags-internal:
+    - task: push-docker-image
+      cmd:
+        - docker push ${docker-internal-image-path}:${var.version}
+        - docker push ${docker-internal-image-path}:${var.version-prefix}-latest
+        - docker push ${docker-internal-image-path}:latest
+
+  remove-image-with-all-tags-internal:
+    - task: imported-ruleset.remove-image-with-all-tags-internal:remove-docker-image-with-tags
+      properties:
+        - docker-internal-image-path: ${docker-internal-image-path}
+
+  lint-dockerfile:
+    - task: imported-ruleset.lint-dockerfile:dockerfile-lint
+
+  build-image-with-proj_oss_releases-path:
+    - task: build-docker-proj_oss_releases-image
+      cmd:
+        - docker build . --build-arg GIT_COMMIT=${var.commit-hash} --build-arg OS_BASE_IMAGE_TAG=${image-base-os-version} --build-arg BUILD_DATE=${env.BUILD_DATE} --build-arg IMAGE_BUILD_VERSION=${var.version} --build-arg RSTATE=${var.rstate} --build-arg ISO_VERSION=${env.ISO_VERSION} --tag ${docker-proj_oss_releases-image-path}:${var.version}
+        - docker image tag ${docker-proj_oss_releases-image-path}:${var.version} ${docker-proj_oss_releases-image-path}:${var.version-prefix}-latest
+        - docker image tag ${docker-proj_oss_releases-image-path}:${var.version} ${docker-proj_oss_releases-image-path}:latest
+
+  push-image-with-proj_oss_releases-path:
+    - task: push-docker-proj_oss_releases-image
+      cmd:
+        - docker push ${docker-proj_oss_releases-image-path}:${var.version}
+        - docker push ${docker-proj_oss_releases-image-path}:${var.version-prefix}-latest
+        - docker push ${docker-proj_oss_releases-image-path}:latest

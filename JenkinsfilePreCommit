@@ -1,0 +1,181 @@
+#!/usr/bin/env groovy
+
+/* IMPORTANT:
+ *
+ * In order to make this pipeline work, the following configuration on Jenkins is required:
+ * - slave with a specific label (see pipeline.agent.label below)
+ * - credentials plugin should be installed and have the secrets with the following names:
+ *   + lciadm100credentials (token to access Artifactory)
+ */
+
+def defaultBobImage = 'armdocker.rnd.ericsson.se/sandbox/adp-staging/adp-cicd/bob.2.0:2.2.6'
+def bob = new BobCommand()
+        .bobImage(defaultBobImage)
+        .envVars([ISO_VERSION: '${ISO_VERSION}', HELM_REPO_TOKEN: '${HELM_REPO_TOKEN}'])
+        .needDockerSocket(true)
+        .toString()
+def failedStage = ''
+pipeline {
+    agent {
+        label 'Cloud-Native'
+    }
+    parameters {
+        string(name: 'ISO_VERSION', defaultValue: '0.0.0', description: 'The ENM ISO version (e.g. 1.65.77)')
+    }
+    stages {
+        stage('Inject Groovy Commands Files') {
+            steps {
+               script {
+                    cbos_script_commands = load("${env.WORKSPACE}/pipeline/scripts/cbos-automation/pipeline_shell_commands.groovy")
+               }
+            }
+        }
+        stage('Inject Credential Files') {
+            steps {
+                withCredentials([file(credentialsId: 'lciadm100-docker-auth', variable: 'dockerConfig')]) {
+                    sh "install -m 600 ${dockerConfig} ${HOME}/.docker/config.json"
+                }
+            }
+        }
+        stage('Checkout Base Image Git Repository') {
+            steps {
+                script {
+                    if (env.GERRIT_CHANGE_NUMBER) {
+                        checkout changelog: true, \
+                        scm: [$class: 'GitSCM', \
+                        branches: [[name: "$GERRIT_REFSPEC"]], \
+                        doGenerateSubmoduleConfigurations: false, \
+                        extensions: [[$class: 'BuildChooserSetting', buildChooser: [$class: 'GerritTriggerBuildChooser']]], \
+                        submoduleCfg: [], \
+                        userRemoteConfigs: [[refspec: "${GERRIT_REFSPEC}", \
+                        url: "${GERRIT_MIRROR}/${GERRIT_PROJECT}"]]]
+                    } else {
+                        println "No GERRIT_CHANGE_NUMBER"
+                        git changelog: true, poll: false, url: '${GERRIT_MIRROR}/${REPO}'
+                    }
+                }
+            }
+        }
+	stage('Init Common Ruleset') {
+            steps {
+                withCredentials([string(credentialsId: 'lciadm100', variable: 'HELM_REPO_TOKEN')]) {
+                    sh "${bob} init-common-ruleset"
+                }
+                archiveArtifacts 'ci/bob/COMMON_RULESET_VERSION'
+            }
+            post {
+                failure {
+                    script {
+                        failedStage = env.STAGE_NAME
+                    }
+                }
+            }
+        }
+        stage('Build Image') {
+            when { not { expression { env.GERRIT_CHANGE_SUBJECT ==~ "^.+?RELEASE. Update Common Base OS to .*" } } }
+            steps {
+                sh "echo ${ISO_VERSION}"
+                sh "${bob} generate-new-version build-image-with-all-tags-internal"
+                script {
+                    env.IMAGE_TAG = sh(script: "cat .bob/var.version", returnStdout:true).trim()
+                    echo "${IMAGE_TAG}"
+                }
+            }
+            post {
+                failure {
+                    script {
+                        failedStage = env.STAGE_NAME
+                        sh "${bob} remove-image-with-all-tags-internal"
+                    }
+                }
+            }
+        }
+        stage('CBO Stage Testing') {
+            when {
+                expression {
+                    env.GERRIT_CHANGE_SUBJECT ==~ "^.+?RELEASE. Update Common Base OS to .*"
+                }
+            }
+            steps {
+                script {
+                    sh "echo ${ISO_VERSION}"
+                    sh "${bob} generate-new-version build-image-with-proj_oss_releases-path " +
+                        "push-image-with-proj_oss_releases-path"
+
+                    env.IMAGE_TAG = sh(script: "cat .bob/var.version", returnStdout:true).trim()
+                    echo "${IMAGE_TAG}"
+
+                    dir('pipeline/scripts/cbos-automation') {
+                        cbos_script_commands.environment_set_up()
+                        cbos_script_commands.clone_cloud_native_repos()
+                        cbos_script_commands.build_impact_chain_and_action_plan()
+                        cbos_script_commands.build_and_push_docker_images_and_generate_report()
+                        cbos_script_commands.build_and_push_docker_images_for_remotedesktop()
+                        cbos_script_commands.print_build_report()
+                    }
+                }
+            }
+            post {
+                failure {
+                    script {
+                        failedStage = env.STAGE_NAME
+                    }
+                }
+                always {
+                    script {
+                    dir('pipeline/scripts/cbos-automation') {
+                            cbos_script_commands.prune_images()
+                            cbos_script_commands.clean_up_environment()
+                        }
+                    }
+                }
+            }
+        }
+    }
+    post {
+        failure {
+            mail to: "${GERRIT_CHANGE_OWNER_EMAIL},${GERRIT_PATCHSET_UPLOADER_EMAIL}",
+                    subject: "Failed Pipeline: ${currentBuild.fullDisplayName}",
+                    body: "Failure on ${env.BUILD_URL}"
+        }
+    }
+}
+
+// More about @Builder: http://mrhaki.blogspot.com/2014/05/groovy-goodness-use-builder-ast.html
+import groovy.transform.builder.Builder
+import groovy.transform.builder.SimpleStrategy
+
+@Builder(builderStrategy = SimpleStrategy, prefix = '')
+class BobCommand {
+    def bobImage = 'bob.2.0:latest'
+    def envVars = [:]
+    def needDockerSocket = false
+
+    String toString() {
+        def env = envVars
+                .collect({ entry -> "-e ${entry.key}=\"${entry.value}\"" })
+                .join(' ')
+
+        def cmd = """\
+            |docker run
+            |--init
+            |--rm
+            |--workdir \${PWD}
+            |--user \$(id -u):\$(id -g)
+            |-v \${PWD}:\${PWD}
+            |-v /home/enmadm100/doc_push/group:/etc/group:ro
+            |-v /home/enmadm100/doc_push/passwd:/etc/passwd:ro
+            |-v \${HOME}/.m2:\${HOME}/.m2
+            |-v \${HOME}/.docker:\${HOME}/.docker
+            |${needDockerSocket ? '-v /var/run/docker.sock:/var/run/docker.sock' : ''}
+            |${env}
+            |\$(for group in \$(id -G); do printf ' --group-add %s' "\$group"; done)
+            |--group-add \$(stat -c '%g' /var/run/docker.sock)
+            |${bobImage}
+            |"""
+        return cmd
+                .stripMargin()           // remove indentation
+                .replace('\n', ' ')      // join lines
+                .replaceAll(/[ ]+/, ' ') // replace multiple spaces by one
+    }
+}
